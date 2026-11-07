@@ -1151,6 +1151,42 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             _reply = await self._hm_slash_confirm_reply(event, _quick_key)
         return _reply
 
+    def _hm_has_pending_reply_prompt(self, session_key: str) -> bool:
+        """A prompt ``_hm_answer_pending_prompt`` may answer waits on a typed reply in *session_key*.
+        Keep in sync with ``_hm_pending_reply_intercepts`` and ``_hm_any_pending_reply_prompt``: a kind
+        missing here queues its typed reply behind the turn waiting for it."""
+        from tools import clarify_gateway, slash_confirm
+        from tools.approval import has_blocking_approval
+        state = self._peek_session_state(session_key)
+        return (clarify_gateway.has_pending(session_key) or has_blocking_approval(session_key)
+                or slash_confirm.get_pending(session_key) is not None
+                or (state is not None and state.persistent.update_prompt_pending))
+
+    def _hm_any_pending_reply_prompt(self) -> bool:
+        """``_hm_has_pending_reply_prompt`` for any session."""
+        from tools import clarify_gateway, slash_confirm
+        from tools.approval import pending_gateway_approval_count
+        # Worker threads insert sessions (``_session_state``): scan a snapshot.
+        return (clarify_gateway.any_pending() or bool(pending_gateway_approval_count()) or slash_confirm.any_pending()
+                or any(state.persistent.update_prompt_pending for state in list(self._sessions_map().values())))
+
+    async def _hm_answer_pending_prompt(
+        self, event: MessageEvent, source: SessionSource, session_key: str
+    ) -> tuple[bool, Optional[str]]:
+        """``(True, reply)`` when *event* answered a prompt its chat's running turn blocks on, in
+        ``_handle_message``'s order: the pending-reply intercepts, then (busy) a bare "yes"/"no" to a
+        blocking approval, which sends its own confirmation. For admissions that never run
+        ``_handle_message`` (``webhook_ingress.admit_producer``): queued, the answer would wait behind
+        the turn that waits for it until the prompt times out. The sender passed admission's
+        authorization (bot-loop cooldown included); an answer starts no turn, so the bot-loop turn
+        budget does not apply."""
+        reply = await self._hm_pending_reply_intercepts(event, source, session_key)
+        if reply is not None:
+            return True, reply
+        answered = (self._is_session_running(session_key) and not getattr(event, "_fifo_only", False)
+                    and await self._route_plaintext_approval_while_busy(event, session_key))
+        return answered, None
+
     async def _hm_dispatch_idle_commands(
         self, event: MessageEvent, source: SessionSource, _quick_key: str
     ) -> tuple[bool, Optional[str]]:

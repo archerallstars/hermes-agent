@@ -120,7 +120,8 @@ def _coalesced_route_refusal(runner, profile, route_config, admission_source):
 
 
 async def admit_producer(adapter, event):
-    """Commit a producer delivery; ``None`` when a plugin skipped or consumed it.
+    """Commit a producer delivery; ``None`` when a plugin skipped or consumed it, or it answered a
+    prompt its chat's running turn blocks on (``GatewayRunner._hm_answer_pending_prompt``).
 
     ``pre_gateway_dispatch`` and ``post_gateway_admission`` (#129958) fire once per admission, like
     ``GatewayInboundMixin._handle_message``: before the commit (a skipped or consumed delivery is
@@ -132,8 +133,17 @@ async def admit_producer(adapter, event):
         from gateway.run_inbound_consumer import POST_ADMISSION_HOOK
         from hermes_cli.lifecycle import has_hook
         webhook = adapter.platform == Platform.WEBHOOK
+        if not webhook and _answer_key(event) in _answered(authority):
+            # A relay re-send of a reply that answered a prompt: consumed, so the FIFO holds no row
+            # to resolve it to. Drop it, never answer the next prompt or run it as a turn. (A re-send
+            # overlapping its original waits behind it in the chat's admission lane.)
+            return None
         hooks = [name for name in ('pre_gateway_dispatch', POST_ADMISSION_HOOK) if has_hook(name)]
-        if not (webhook or hooks):
+        # A chat reply to a prompt the running turn blocks on is offered to it under the delivery
+        # turn, so a relay re-send of a committed reply is never answered twice.
+        if not (webhook or hooks or getattr(event, '_admitted_on_reader', False)
+                or authority.runner._hm_has_pending_reply_prompt(
+                    authority.runner._session_key_for_source(event.source))):
             return await _admit_native(authority, event)
         from gateway.session_authority import native_write_started
         payload, principal = await _prepared(authority, event)
@@ -162,7 +172,9 @@ async def _admit_once(authority, event, webhook, hooks, committed):
         if prior is not None:
             return prior
     admitted = event
-    if hooks and (webhook or not committed[1]):
+    # Offered before the commit: a webhook to its hooks (a retry was answered above), a chat delivery
+    # never committed to its hooks and to any prompt its chat's running turn blocks on.
+    if bool(hooks) if webhook else not committed[1]:
         runner = authority.runner
         if 'pre_gateway_dispatch' in hooks:
             admitted = await runner._hm_pre_gateway_dispatch_hook(event, event.source)
@@ -174,13 +186,35 @@ async def _admit_once(authority, event, webhook, hooks, committed):
                 # a provider retry or relay re-send resends that, and resolves to this row.
                 from gateway.session_ingress_media import ingress_fingerprint
                 admitted._ingress_sha256 = ingress_fingerprint(committed[0], event.raw_message)
-        if POST_ADMISSION_HOOK in hooks:
+        key = runner._session_key_for_source(admitted.source)
+        consumed = False
+        if not (webhook or getattr(event, '_admitted_on_reader', False)):
+            # A chat reply to a prompt its chat's running turn blocks on answers it, after
+            # pre_gateway_dispatch and before post_gateway_admission, as in _handle_message. Never
+            # on the relay reader: answering may send, and only that reader acknowledges a send.
+            # Recorded before answering: an answer resolves the prompt, then may await its
+            # confirmation send, and a cancel there leaves the frame unACKed. Its re-send must not
+            # answer the next prompt (a replayed "yes" approving a later command), so a cancelled
+            # answer keeps its receipt: fail closed, the user types it again.
+            answered, answer_key = _answered(authority), _answer_key(event)
+            if event.message_id:
+                answered[answer_key] = None
+                while len(answered) > _ANSWERED_MAX:
+                    answered.pop(next(iter(answered)))
+            try:
+                consumed, event._consumer_reply = await runner._hm_answer_pending_prompt(
+                    admitted, admitted.source, key)
+            except Exception:  # an error, unlike a cancel, is retried by the re-send it allows
+                answered.pop(answer_key, None)
+                raise
+            if not consumed:
+                answered.pop(answer_key, None)
+        if not consumed and POST_ADMISSION_HOOK in hooks:
             from gateway.run_inbound_consumer import run_post_admission_hook
-            consumed, event._consumer_reply = await run_post_admission_hook(
-                runner, admitted, admitted.source, runner._session_key_for_source(admitted.source))
-            if consumed:
-                await _release_preparation(authority, committed[0])
-                return None
+            consumed, event._consumer_reply = await run_post_admission_hook(runner, admitted, admitted.source, key)
+        if consumed:
+            await _release_preparation(authority, committed[0])
+            return None
     return await _admit_native(authority, admitted)
 
 
@@ -194,6 +228,20 @@ async def _admit_native(authority, event):
 # Producer deliveries in flight by (profile, principal, provider id) -> [lock, holder + waiters]. This
 # gateway is the only owner of producer ingress, so in-process coordination covers every request.
 _deliveries = {}
+_ANSWERED_MAX = 1024
+
+
+def _answered(authority):
+    """The chat deliveries that answered a prompt of *authority*'s sessions, oldest first. Consumed,
+    no FIFO row records them, so a relay re-send of one is dropped by this instead of answering the
+    next prompt. Bounded like the relay adapter's own replay set (``RelayAdapter._seen_inbound``),
+    which native deliveries bypass."""
+    return authority.__dict__.setdefault('_answered_deliveries', {})
+
+
+def _answer_key(event):
+    """The relay adapter's replay identity (platform, chat, message id); an edit is its own input."""
+    return event.source.platform.value, event.source.chat_id, event.message_id, event.edit_revision
 
 
 @asynccontextmanager
